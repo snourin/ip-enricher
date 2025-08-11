@@ -16,6 +16,7 @@ import (
 	flag "github.com/spf13/pflag"
 
 	mrt "github.com/jackyyf/go-mrt"
+	"github.com/schollz/progressbar/v3"
 )
 
 const (
@@ -45,6 +46,9 @@ var (
 	// Maps for v4 and v6 prefixes to ASN
 	v4PrefixMap = make(map[string]int)
 	v6PrefixMap = make(map[string]int)
+	// Maps for v4 and v6 prefixes that map to multiple ASNs
+	v4MultiASNMap = make(map[string]map[int]struct{})
+	v6MultiASNMap = make(map[string]map[int]struct{})
 	// Default routes for v4 and v6
 	v4Default = ipaddr.NewIPAddressString("0.0.0.0/0").GetAddress()
 	v6Default = ipaddr.NewIPAddressString("::/0").GetAddress()
@@ -68,6 +72,17 @@ type Record struct {
 	Prefix string `json:"prefix"`
 	ASN    int    `json:"asn"`
 	ASNData
+}
+
+// Converts to []int
+func keysFromMap(m map[int]struct{}) []int {
+	keys := make([]int, 0, len(m))
+
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	return keys
 }
 
 // queryASN data makes a DNS query to Team Cymru to get ASN data like ASN name,
@@ -192,11 +207,53 @@ func readRIB(file string) {
 				continue
 			} else if addr.IsIPv4() {
 				v4Trie.Add(addr)
-				v4PrefixMap[prefix] = originASN
+				if _, ok := v4MultiASNMap[prefix]; !ok {
+					v4MultiASNMap[prefix] = make(map[int]struct{})
+				}
+
+				for _, entry := range ribtable.RIBEntries { //iterate through each RIB entry
+					for _, attr := range entry.BGPAttributes { //iterate through each RIB entry's BGP attributes
+						if attr.TypeCode == 2 { //if the BGP attribute is of type 2 (the as path attribute)
+							asPath := attr.Value.(mrt.BGPPathAttributeASPath)
+							if len(asPath) > 0 {
+								asPathSegment := asPath[0]
+								if len(asPathSegment.Value) > 0 {
+									peerOriginASN, _ := strconv.Atoi(asPathSegment.Value[len(asPathSegment.Value)-1].String())
+									v4MultiASNMap[prefix][peerOriginASN] = struct{}{}
+
+									// Record first ASN in v4PrefixMap for normal lookups
+									if _, exists := v4PrefixMap[prefix]; !exists {
+										v4PrefixMap[prefix] = peerOriginASN
+									}
+								}
+							}
+						}
+					}
+				}
 			} else if addr.IsIPv6() {
 				v6Trie.Add(addr)
-				v6PrefixMap[prefix] = originASN
+				if _, ok := v6MultiASNMap[prefix]; !ok {
+					v6MultiASNMap[prefix] = make(map[int]struct{})
+				}
 
+				for _, entry := range ribtable.RIBEntries {
+					for _, attr := range entry.BGPAttributes {
+						if attr.TypeCode == 2 {
+							asPath := attr.Value.(mrt.BGPPathAttributeASPath)
+							if len(asPath) > 0 {
+								asPathSegment := asPath[0]
+								if len(asPathSegment.Value) > 0 {
+									peerOriginASN, _ := strconv.Atoi(asPathSegment.Value[len(asPathSegment.Value)-1].String())
+									v6MultiASNMap[prefix][peerOriginASN] = struct{}{}
+
+									if _, exists := v6PrefixMap[prefix]; !exists {
+										v6PrefixMap[prefix] = peerOriginASN
+									}
+								}
+							}
+						}
+					}
+				}
 			} else {
 				log.Errorf("Unknown IP address type: %s", addr)
 			}
@@ -204,11 +261,9 @@ func readRIB(file string) {
 		}
 	}
 
-}
-
 // readFile reads a file of IPs and looks up the prefix and ASN for each IP
 // outputs results to stdout or a file according to runtime flags
-func readFile(file string) {
+func readFile(file string, multiASNWriter *bufio.Writer) {
 
 	f, err := os.Open(file)
 	if err != nil {
@@ -216,9 +271,13 @@ func readFile(file string) {
 	}
 	defer f.Close()
 
+	fileInfo, _ := f.Stat()
+    bar := progressbar.DefaultBytes(fileInfo.Size(), "Processing IPs")
+
 	// Read the file line by line
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
+		bar.Add(len(scanner.Bytes()) + 1)
 
 		// Create a new record
 		record := Record{}
@@ -236,12 +295,38 @@ func readFile(file string) {
 			if prefix != nil {
 				prefix_string = prefix.String()
 				ASN = v4PrefixMap[prefix.String()]
+
+				// Get all ASNs for this prefic
+				asns := v4MultiASNMap[prefix_string]
+				if len(asns) > 1 {
+					asnsSlice := keysFromMap(asns)                      // converts to []int
+					asnsStrSlice := make([]string, len(asnsSlice))      // converts to []string
+
+					for i, asn := range asnsSlice {
+						asnsStrSlice[i] = strconv.Itoa(asn)
+					}
+
+					multiASNWriter.WriteString(fmt.Sprintf("%v,%v,%v\n", ip, prefix_string, strings.Join(asnsStrSlice, ",")))
+				}
 			}
 		} else if addr.IsIPv6() {
 			prefix := v6Trie.LongestPrefixMatch(addr)
 			if prefix != nil {
 				prefix_string = prefix.String()
 				ASN = v6PrefixMap[prefix.String()]
+
+				// Get all ASNs for this prefix
+				asns := v6MultiASNMap[prefix_string]
+				if len(asns) > 1 {
+					asnsSlice := keysFromMap(asns)                       // []int
+					asnsStrSlice := make([]string, len(asnsSlice))      // []string
+
+					for i, asn := range asnsSlice {
+						asnsStrSlice[i] = strconv.Itoa(asn)
+					}
+
+					multiASNWriter.WriteString(fmt.Sprintf("%v,%v,%v\n", ip, prefix_string, strings.Join(asnsStrSlice, ",")))
+				}
 			}
 		} else {
 			log.Errorf("Unknown IP address type: %s", addr)
@@ -336,9 +421,21 @@ func main() {
 	wg.Wait()
 	log.Infoln("All RIB files read; processing IP file")
 
+	multiASNFile, err := os.Create("multi_asn.txt")
+	if err != nil {
+		log.Fatal("Error creating multi-ASN file: ", err)
+	}
+	defer multiASNFile.Close()
+
+	multiASNWriter := bufio.NewWriter(multiASNFile)
+	defer func() {
+		multiASNWriter.Flush()
+		multiASNFile.Close()
+	}()
+
 	if file != "" {
 		// read the IP file
-		readFile(file)
+		readFile(file, multiASNWriter)
 	}
 
 	log.Infoln("Completed")
