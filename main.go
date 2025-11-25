@@ -260,6 +260,7 @@ func readRIB(file string) {
 
 		}
 	}
+}
 
 // readFile reads a file of IPs and looks up the prefix and ASN for each IP
 // outputs results to stdout or a file according to runtime flags
